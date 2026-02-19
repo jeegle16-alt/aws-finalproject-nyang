@@ -1,29 +1,27 @@
 """
 src/steps/decoder.py
-─────────────────────
-notebooks/v3_DECODER.ipynb 전체 로직 모듈화.
+====================
+v3_DECODER.ipynb 로직을 그대로 포팅.
 
-I/O 없음 – 순수 pandas/numpy 계산만.
-
-공개 API:
-  decode(df, config, *, debug=False) -> pd.DataFrame
-    model_out DataFrame → cat_state / notify_level / decoder_quality
+[변경점 - 로직 외]
+- 입력: model_out_v3 DataFrame
+- 출력: state_out_v3 DataFrame
+- 로직: 100% 동일
 """
-from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 상수 (notebook 0.3 / cell 6 그대로)
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 0. 상수  (v3_DECODER 그대로)
+# ---------------------------------------------------------------------------
 
 RISK_LOW    = 0.45
 RISK_ALERT  = 0.60
 RISK_SEVERE = 0.70
 
-STATE_PRIORITY: Dict[str, int] = {
+STATE_PRIORITY = {
     "NO_DATA":  100,
     "TRAVEL":    90,
     "CHAOS":     70,
@@ -32,97 +30,188 @@ STATE_PRIORITY: Dict[str, int] = {
     "STABLE":    10,
 }
 
-SLEEP_FEATURES    = ["night_ratio_z",      "overnight_gap_z"]
-LETHARGY_FEATURES = ["daily_event_cnt_z",  "UserAct_z",     "Screen_z"]
-CHAOS_FEATURES    = ["hour_entropy_z",     "gap_max_z",     "gap_cnt_6h_z"]
+SLEEP_FEATURES = ["night_ratio_z", "overnight_gap_z"]
+LETHARGY_FEATURES = ["daily_event_cnt_z", "UserAct_z", "Screen_z"]
+CHAOS_FEATURES = ["hour_entropy_z", "gap_max_z", "gap_cnt_6h_z"]
 
-Z_THRESHOLD       = 2.0
+Z_THRESHOLD = 2.0
 GROUP_Z_THRESHOLD = 1.5
 
-GROUP_REP_MAP: Dict[str, str] = {
+GROUP_REP_MAP = {
     "rhythm":  "z_rhythm_rep",
     "core":    "z_core_rep",
     "gap":     "z_gap_rep",
     "session": "z_session_rep",
 }
 
-STAGE_NOTIFY_MAP: Dict[str, str] = {
+STAGE_NOTIFY_MAP = {
     "ONBOARD":    "NONE",
     "WARMUP":     "NONE",
     "SEMI_READY": "LOW",
     "READY":      "NORMAL",
 }
 
-OUTPUT_COLS = [
-    "uuid", "date", "cat_state", "notify_level", "decoder_quality",
-    "risk_used", "risk_score", "final_risk", "risk_band",
-    "top_z_feature", "top_z_value",
-]
+OPTIONAL_DEFAULTS = {
+    "final_risk":        np.nan,
+    "early_risk":        np.nan,
+    "baseline_ready":    False,
+    "early_ready":       False,
+    "has_activity":      False,
+    "partial_flag":      False,
+    "tz_flag":           False,
+    "stable_hold_flag":  False,
+    "drift_flag":        False,
+    "drift_top_feature": "",
+}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 내부 함수 (notebook 3.1 / 5.1 / 5.2 / 5.3 / 6.1 / 6.2 / 6.3 / 7.1 / 8.1)
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 1. Utility  (v3_DECODER 그대로)
+# ---------------------------------------------------------------------------
 
-def _get_risk_band(risk: float, risk_low: float, risk_alert: float, risk_severe: float) -> str:
-    """notebook 3.1 get_risk_band."""
+def get_risk_band(risk: float) -> str:
     if pd.isna(risk):
         return "UNKNOWN"
-    if risk < risk_low:
+    if risk < RISK_LOW:
         return "SAFE"
-    elif risk < risk_alert:
+    elif risk < RISK_ALERT:
         return "WATCH"
-    elif risk < risk_severe:
+    elif risk < RISK_SEVERE:
         return "ALERT"
     else:
         return "SEVERE"
 
 
-def _get_top_z_feature(
-    row: pd.Series,
-    z_cols: List[str],
-) -> Tuple[str, float]:
-    """notebook 5.1 get_top_z_feature."""
-    zvals = row[z_cols].dropna()
+def get_base_notify(risk_band: str) -> str:
+    mapping = {"SAFE": "NONE", "WATCH": "NONE", "ALERT": "LOW", "SEVERE": "HIGH"}
+    return mapping.get(risk_band, "NONE")
+
+
+# ---------------------------------------------------------------------------
+# 2. 전처리  (v3_DECODER Section 1-2 그대로)
+# ---------------------------------------------------------------------------
+
+def _preprocess(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+
+    # optional 컬럼 없으면 default 생성
+    for c, v in OPTIONAL_DEFAULTS.items():
+        if c not in df.columns:
+            df[c] = v
+
+    # 타입 정규화
+    bool_cols = ["travel_flag", "partial_flag", "tz_flag", "baseline_ready",
+                 "early_ready", "has_activity", "stable_hold_flag", "drift_flag"]
+    for c in bool_cols:
+        if c in df.columns:
+            df[c] = df[c].astype("boolean").fillna(False)
+
+    for c in ["risk_score", "final_risk", "early_risk"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    for c in ["quality_state", "context_mode", "cold_stage"]:
+        if c in df.columns:
+            df[c] = df[c].astype("string")
+
+    # risk_used: final_risk 우선, 없으면 risk_score
+    df["risk_used"] = df["final_risk"]
+    df.loc[df["risk_used"].isna(), "risk_used"] = df.loc[df["risk_used"].isna(), "risk_score"]
+
+    # Z 컬럼 목록
+    z_cols = [c for c in df.columns if c.endswith("_z") and not c.endswith("_z_early")]
+
+    return df, z_cols
+
+
+# ---------------------------------------------------------------------------
+# 3. Gate  (v3_DECODER Section 3 그대로)
+# ---------------------------------------------------------------------------
+
+def _compute_gate(df: pd.DataFrame) -> pd.DataFrame:
+    df["quality_fail"] = (df["quality_state"] == "LOW_CONF")
+    df["analysis_ready"] = (
+        (~df["quality_fail"])
+        & (df["risk_used"].notna())
+        & (df["baseline_ready"] | df["early_ready"])
+    )
+    df["is_no_data"] = ~df["analysis_ready"]
+    df["analysis_ok"] = df["analysis_ready"]
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 4. Risk band + TRAVEL  (v3_DECODER 그대로)
+# ---------------------------------------------------------------------------
+
+def _compute_risk_band_travel(df: pd.DataFrame) -> pd.DataFrame:
+    df["risk_band"] = df["risk_used"].apply(get_risk_band)
+    df["is_travel"] = df["travel_flag"].fillna(False)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 5. Top-Z feature  (v3_DECODER 그대로)
+# ---------------------------------------------------------------------------
+
+def _get_top_z_feature(row: pd.Series, z_cols: List[str]) -> Tuple[str, float]:
+    zvals = row[z_cols]
+    zvals = zvals[pd.notna(zvals)]
     if len(zvals) == 0:
-        return "none", 0.0
+        return ("none", 0.0)
     top_col = zvals.abs().idxmax()
-    return top_col, float(zvals[top_col])
+    return (top_col, float(zvals[top_col]))
 
 
-def _decode_pattern_state(
-    row: pd.Series,
-    group_z_threshold: float,
-    z_threshold: float,
-) -> str:
-    """notebook 5.2 decode_pattern_state – 그룹별 대표 Z + Top-Z 기반."""
+def _compute_top_z(df: pd.DataFrame, z_cols: List[str]) -> pd.DataFrame:
+    df["top_z_feature"] = "none"
+    df["top_z_value"]   = 0.0
+
+    mask = df["analysis_ok"]
+    if mask.any() and z_cols:
+        results = df.loc[mask].apply(lambda r: _get_top_z_feature(r, z_cols), axis=1)
+        df.loc[mask, "top_z_feature"] = results.apply(lambda x: x[0]).astype("string")
+        df.loc[mask, "top_z_value"]   = results.apply(lambda x: x[1]).astype(float)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 6. Pattern state  (v3_DECODER 그대로)
+# ---------------------------------------------------------------------------
+
+def decode_pattern_state(row: pd.Series) -> str:
+    """
+    [v3] 그룹별 대표 Z + Top-Z feature 기반 상태 판정
+    1차: 그룹 대표값(z_rhythm_rep, z_core_rep, z_gap_rep)
+    2차: Top-Z feature fallback
+    """
     top_feature = row["top_z_feature"]
-    top_value   = row["top_z_value"]
+    top_value = row["top_z_value"]
 
-    rhythm_rep  = float(row.get("z_rhythm_rep",  0) or 0)
-    core_rep    = float(row.get("z_core_rep",    0) or 0)
-    gap_rep     = float(row.get("z_gap_rep",     0) or 0)
+    rhythm_rep = float(row.get("z_rhythm_rep",  0) or 0)
+    core_rep = float(row.get("z_core_rep",    0) or 0)
+    gap_rep = float(row.get("z_gap_rep",     0) or 0)
 
     candidates: Dict[str, float] = {}
-
-    if rhythm_rep >= group_z_threshold:
+    if rhythm_rep >= GROUP_Z_THRESHOLD:
         candidates["SLEEP"] = rhythm_rep
-
-    if core_rep >= group_z_threshold:
+    if core_rep >= GROUP_Z_THRESHOLD:
         if top_feature in LETHARGY_FEATURES and top_value < 0:
             candidates["LETHARGY"] = core_rep
         elif top_feature not in LETHARGY_FEATURES:
             pass
         else:
             candidates["LETHARGY"] = core_rep
-
-    if gap_rep >= group_z_threshold:
+    if gap_rep >= GROUP_Z_THRESHOLD:
         candidates["CHAOS"] = gap_rep
 
     if candidates:
         return max(candidates, key=candidates.get)
 
-    if abs(top_value) < z_threshold:
+    # fallback: Top-Z
+    if abs(top_value) < Z_THRESHOLD:
         return "STABLE"
     if top_feature in SLEEP_FEATURES:
         return "SLEEP"
@@ -133,8 +222,20 @@ def _decode_pattern_state(
     return "STABLE"
 
 
-def _determine_cat_state(row: pd.Series) -> str:
-    """notebook 5.3 determine_cat_state."""
+def _compute_pattern_state(df: pd.DataFrame) -> pd.DataFrame:
+    df["pattern_state"] = "UNKNOWN"
+    mask = df["analysis_ok"]
+    if mask.any():
+        df.loc[mask, "pattern_state"] = df.loc[mask].apply(decode_pattern_state, axis=1)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 7. Cat state (최종)  (v3_DECODER 그대로)
+# ---------------------------------------------------------------------------
+
+def determine_cat_state(row: pd.Series) -> str:
+    """우선순위: NO_DATA > TRAVEL > Pattern"""
     if row["is_no_data"]:
         return "NO_DATA"
     if row["is_travel"]:
@@ -142,19 +243,16 @@ def _determine_cat_state(row: pd.Series) -> str:
     return row["pattern_state"]
 
 
-def _get_base_notify(risk_band: str) -> str:
-    """notebook 6.1 get_base_notify."""
-    if risk_band in ("SAFE", "WATCH"):
-        return "NONE"
-    elif risk_band == "ALERT":
-        return "LOW"
-    elif risk_band == "SEVERE":
-        return "HIGH"
-    return "NONE"
+def _compute_cat_state(df: pd.DataFrame) -> pd.DataFrame:
+    df["cat_state"] = df.apply(determine_cat_state, axis=1)
+    return df
 
 
-def _apply_context_downshift(row: pd.Series) -> str:
-    """notebook 6.2 apply_context_downshift."""
+# ---------------------------------------------------------------------------
+# 8. Notify  (v3_DECODER 그대로)
+# ---------------------------------------------------------------------------
+
+def apply_context_downshift(row: pd.Series) -> str:
     base = row["base_notify"]
     if row["is_travel"]:
         return "NONE"
@@ -163,9 +261,8 @@ def _apply_context_downshift(row: pd.Series) -> str:
     return base
 
 
-def _determine_notify_level(row: pd.Series) -> str:
-    """notebook 6.3 determine_notify_level."""
-    if row["cat_state"] in ("NO_DATA", "TRAVEL"):
+def determine_notify_level(row: pd.Series) -> str:
+    if row["cat_state"] in ["NO_DATA", "TRAVEL"]:
         return "NONE"
     if row["cat_state"] == "STABLE":
         if bool(row.get("stable_hold_flag", False)):
@@ -176,159 +273,90 @@ def _determine_notify_level(row: pd.Series) -> str:
     return row["notify_after_context"]
 
 
-def _apply_cold_start_policy(row: pd.Series) -> str:
-    """notebook 7.1 apply_cold_start_policy."""
+def apply_cold_start_policy(row: pd.Series) -> str:
     stage  = row["cold_stage"]
     notify = row["notify_level"]
     if pd.isna(stage):
         return notify
     stage = str(stage).upper()
-    if stage in ("ONBOARD", "WARMUP"):
+    if stage in ["ONBOARD", "WARMUP"]:
         return "NONE"
     elif stage == "SEMI_READY":
         return "LOW" if notify == "HIGH" else notify
-    return notify  # READY
+    else:
+        return notify
 
 
-def _get_decoder_quality(row: pd.Series) -> str:
-    """notebook 8.1 get_decoder_quality."""
+def get_decoder_quality(row: pd.Series) -> str:
     if row["cat_state"] == "NO_DATA":
         return "LOW_CONF" if row["quality_state"] == "LOW_CONF" else "NO_DATA"
     return "OK"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 공개 API
-# ──────────────────────────────────────────────────────────────────────────────
+def _compute_notify(df: pd.DataFrame) -> pd.DataFrame:
+    df["base_notify"] = df["risk_band"].apply(get_base_notify)
+    df["notify_after_context"] = df.apply(apply_context_downshift, axis=1)
+    df["notify_level"] = df.apply(determine_notify_level, axis=1)
+    df["notify_final"] = df.apply(apply_cold_start_policy, axis=1)
+    df["decoder_quality"] = df.apply(get_decoder_quality, axis=1)
+    return df
 
-def decode(
-    df: pd.DataFrame,
-    config: dict,
-    *,
-    debug: bool = False,
-) -> pd.DataFrame:
+
+# ---------------------------------------------------------------------------
+# 9. Output  (v3_DECODER 그대로)
+# ---------------------------------------------------------------------------
+
+OUTPUT_COLS = [
+    "uuid", "date", "cat_state", "notify_final", "decoder_quality", "risk_used", "risk_score", "final_risk", "risk_band", "top_z_feature", "top_z_value",
+]
+
+
+def _build_output(df: pd.DataFrame) -> pd.DataFrame:
+    output = df.copy()
+    # notify_final을 notify_level로 노출 (v3_DECODER 출력 스키마)
+    output["notify_level"] = output["notify_final"]
+    output["date"] = pd.to_datetime(output["date"]).dt.strftime("%Y-%m-%d")
+
+    cols = [c for c in OUTPUT_COLS if c in output.columns]
+    # notify_level 없으면 추가
+    if "notify_level" in output.columns and "notify_level" not in cols:
+        cols.insert(cols.index("notify_final") + 1, "notify_level")
+
+    return output[cols].copy()
+
+
+# ---------------------------------------------------------------------------
+# 10. 메인 진입점
+# ---------------------------------------------------------------------------
+
+def run(model_out_df: pd.DataFrame) -> pd.DataFrame:
     """
-    model_out DataFrame → cat_state / notify_level / decoder_quality.
+    DECODER Step 메인 함수.
 
-    선행 조건: run_model() 완료
-      (risk_score, final_risk, quality_state, cold_stage, travel_flag, z_*_rep, …)
+    Parameters
+    ----------
+    model_out_df : pd.DataFrame
+        model.run() 출력 (model_out_v3)
 
     Returns
     -------
-    pd.DataFrame  (OUTPUT_COLS 컬럼 포함)
+    pd.DataFrame
+        state_out_v3 — uuid, date, cat_state, notify_level, decoder_quality 포함
     """
-    df = df.copy()
-    dc = config.get("decoder", {})
+    print(f"[DECODER] input: {model_out_df.shape}")
 
-    risk_low       = float(dc.get("risk_low",        RISK_LOW))
-    risk_alert     = float(dc.get("risk_alert",      RISK_ALERT))
-    risk_severe    = float(dc.get("risk_severe",     RISK_SEVERE))
-    z_threshold    = float(dc.get("z_threshold",     Z_THRESHOLD))
-    group_z_thr    = float(dc.get("group_z_threshold", GROUP_Z_THRESHOLD))
+    df, z_cols = _preprocess(model_out_df)
+    df = _compute_gate(df)
+    df = _compute_risk_band_travel(df)
+    df = _compute_top_z(df, z_cols)
+    df = _compute_pattern_state(df)
+    df = _compute_cat_state(df)
+    df = _compute_notify(df)
 
-    # ── 1.3  타입 표준화 ────────────────────────────────────────────────────
-    BOOL_COLS = [
-        "travel_flag", "partial_flag", "tz_flag",
-        "baseline_ready", "early_ready", "has_activity",
-        "stable_hold_flag", "drift_flag",
-    ]
-    for c in BOOL_COLS:
-        if c in df.columns:
-            df[c] = df[c].astype("boolean").fillna(False)
+    state_out = _build_output(df)
 
-    for c in ("risk_score", "final_risk", "early_risk"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    print(f"[DECODER] output: {state_out.shape}")
+    print("[DECODER] cat_state dist:")
+    print(state_out["cat_state"].value_counts().to_dict())
 
-    for c in ("quality_state", "context_mode", "cold_stage"):
-        if c in df.columns:
-            df[c] = df[c].astype("string")
-
-    # optional defaults
-    OPTIONAL_DEFAULTS = {
-        "final_risk":         np.nan,
-        "early_risk":         np.nan,
-        "baseline_ready":     False,
-        "early_ready":        False,
-        "has_activity":       False,
-        "partial_flag":       False,
-        "tz_flag":            False,
-        "stable_hold_flag":   False,
-        "drift_flag":         False,
-        "drift_top_feature":  "",
-    }
-    for c, v in OPTIONAL_DEFAULTS.items():
-        if c not in df.columns:
-            df[c] = v
-
-    # risk_used (final_risk 우선)
-    df["risk_used"] = df["final_risk"]
-    df.loc[df["risk_used"].isna(), "risk_used"] = df.loc[df["risk_used"].isna(), "risk_score"]
-
-    # ── 2.1  NO_DATA gate ───────────────────────────────────────────────────
-    df["quality_fail"] = (df["quality_state"] == "LOW_CONF")
-    df["analysis_ready"] = (
-        (~df["quality_fail"])
-        & df["risk_used"].notna()
-        & (df["baseline_ready"] | df["early_ready"])
-    )
-    df["is_no_data"] = ~df["analysis_ready"]
-    df["analysis_ok"] = df["analysis_ready"]
-
-    if debug:
-        print(f"[DECODER] NO_DATA={df['is_no_data'].sum()}, analysis_ok={df['analysis_ok'].sum()}")
-
-    # ── 3.1  risk_band ──────────────────────────────────────────────────────
-    df["risk_band"] = df["risk_used"].apply(
-        lambda r: _get_risk_band(r, risk_low, risk_alert, risk_severe)
-    )
-
-    # ── 4.1  TRAVEL override ────────────────────────────────────────────────
-    df["is_travel"] = df["travel_flag"].fillna(False)
-
-    # ── 5.1  Top-Z feature ──────────────────────────────────────────────────
-    z_cols = [c for c in df.columns if c.endswith("_z") and not c.endswith("_z_early")]
-    df["top_z_feature"] = "none"
-    df["top_z_value"]   = 0.0
-
-    mask = df["analysis_ok"]
-    if mask.any() and z_cols:
-        topz = df.loc[mask].apply(
-            lambda r: _get_top_z_feature(r, z_cols), axis=1
-        )
-        df.loc[mask, "top_z_feature"] = topz.apply(lambda x: x[0]).astype("string")
-        df.loc[mask, "top_z_value"]   = topz.apply(lambda x: x[1]).astype(float)
-
-    # ── 5.2  pattern_state ──────────────────────────────────────────────────
-    df["pattern_state"] = "UNKNOWN"
-    if mask.any():
-        df.loc[mask, "pattern_state"] = df.loc[mask].apply(
-            lambda r: _decode_pattern_state(r, group_z_thr, z_threshold), axis=1
-        )
-
-    # ── 5.3  cat_state ──────────────────────────────────────────────────────
-    df["cat_state"] = df.apply(_determine_cat_state, axis=1)
-
-    # ── 6.1  base_notify ────────────────────────────────────────────────────
-    df["base_notify"] = df["risk_band"].apply(_get_base_notify)
-
-    # ── 6.2  context downshift ───────────────────────────────────────────────
-    df["notify_after_context"] = df.apply(_apply_context_downshift, axis=1)
-
-    # ── 6.3  notify_level ────────────────────────────────────────────────────
-    df["notify_level"] = df.apply(_determine_notify_level, axis=1)
-
-    # ── 7.1  cold-start policy ───────────────────────────────────────────────
-    df["notify_final"] = df.apply(_apply_cold_start_policy, axis=1)
-    df["notify_level"] = df["notify_final"]   # 최종
-
-    # ── 8.1  decoder_quality ─────────────────────────────────────────────────
-    df["decoder_quality"] = df.apply(_get_decoder_quality, axis=1)
-
-    if debug:
-        print(f"[DECODER] cat_state:\n{df['cat_state'].value_counts()}")
-        print(f"[DECODER] notify_level:\n{df['notify_level'].value_counts()}")
-
-    # ── 8.2  출력 컬럼 선택 ────────────────────────────────────────────────
-    # OUTPUT_COLS에 없는 컬럼도 df에 유지 (batch_runner가 더 넓게 저장할 수 있도록)
-    return df
+    return state_out

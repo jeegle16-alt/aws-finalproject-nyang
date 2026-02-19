@@ -1,14 +1,29 @@
-# Core data
+# =============================================================================
+# NYAN-MATE ML Pipeline — requirements.txt
+# =============================================================================
+# SageMaker Distribution 이미지 기준 (train.py / batch_runner.py 공용)
+#
+# SageMaker Distribution에 이미 포함된 패키지:
+#   numpy, pandas, scikit-learn, boto3, pyarrow, scipy, matplotlib 등
+#
+# 아래는 최소 버전 pin — 이미지에 없거나 버전 보장이 필요한 경우만 명시
+# =============================================================================
+
+# --- 핵심 ML ---
 numpy>=1.24
 pandas>=2.0
-pyarrow>=12.0
+scikit-learn>=1.3       # IsolationForest, train/infer 양쪽 사용
 
-# ML
-scikit-learn>=1.3
+# --- AWS ---
+boto3>=1.26             # S3 read/write, SageMaker API
+pyarrow>=12.0           # parquet 읽기 (silver ETL)
 
-# AWS
-boto3>=1.28
-s3fs>=2023.6
+# --- 설정 파일 ---
+pyyaml>=6.0             # config.yaml 로드
 
-# Config
-pyyaml>=6.0
+# =============================================================================
+# requirements-lambda.txt  (Lambda 레이어용 — 별도 관리)
+# =============================================================================
+# Lambda 런타임(Python 3.12)에는 boto3가 기본 포함이므로 추가 패키지 없음.
+# trigger_training.py 의존성: boto3만 (내장)
+# → Lambda 레이어 불필요

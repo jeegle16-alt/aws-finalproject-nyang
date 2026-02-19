@@ -1,54 +1,153 @@
+# =============================================================================
+# NYAN-MATE ML Pipeline Config
+# =============================================================================
+# 사용처:
+#   train.py        → s3, training 섹션
+#   batch_runner.py → s3, inference 섹션
+#   trigger_training.py → aws 섹션
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# S3 경로
+# -----------------------------------------------------------------------------
 s3:
-  silver_bucket: "silver-dummy"
-  ml_bucket: "nyang-ml-apne2-dev"
-  ml_prefix: "ml"
+  # 공개데이터셋 (학습용 초기 데이터)
+  public_dataset: "s3://nyang-ml-apne2-dev/ml/inputs/public-dataset/"
 
-paths:
-  artifacts_models: "ml/artifacts/models/"
-  baseline: "ml/baseline/"
-  outputs: "ml/outputs/"
+  # silver parquet (사용자 ETL 원본)
+  silver_events: "s3://silver-dummy/silver_events/"
 
-fe:
-  chunksize: 300000        # 참고용 (모듈에선 미사용)
-  long_session_sec: 1800   # 30분
+  # 학습된 모델 저장 경로
+  model_artifacts: "s3://nyang-ml-apne2-dev/ml/artifacts/models/"
 
-baseline:
-  lt_window: 56
-  st_window: 14
-  early_window: 7
-  lt_minp: 14
-  st_minp_split: 5
-  st_minp_global: 7
-  early_minp: 3
-  winsorize_lower: 0.005
-  winsorize_upper: 0.995
-  default_floor: 0.1
+  # 추론 결과 저장 경로
+  # 실제 저장: {outputs}/dt=YYYY-MM-DD/state_out_v3.csv
+  outputs: "s3://nyang-ml-apne2-dev/ml/outputs/"
 
+  # baseline 디버그 저장 (선택, 비워두면 저장 안 함)
+  baseline_debug: ""
+
+
+# -----------------------------------------------------------------------------
+# 학습 설정
+# -----------------------------------------------------------------------------
+training:
+  # ETL parquet에서 읽어올 과거 일수 (IF 학습용)
+  # LT_WINDOW = 56일이므로 56 이상 권장
+  lookback_days: 56
+
+  # SageMaker Training Job 설정
+  sagemaker:
+    instance_type: "ml.m5.xlarge"
+    volume_size_gb: 30
+    max_runtime_sec: 3600       # 최대 1시간
+    # 트리거: 매주 월요일 03:00 KST (일요일 18:00 UTC)
+    schedule: "cron(0 18 ? * SUN *)"
+
+  # IsolationForest 하이퍼파라미터 (model.py 상수와 동기화)
+  isolation_forest:
+    n_estimators: 300
+    contamination: 0.05
+    random_state: 42
+
+
+# -----------------------------------------------------------------------------
+# 추론 설정 (batch_runner / inference)
+# -----------------------------------------------------------------------------
+inference:
+  # rolling baseline 계산을 위한 lookback 일수
+  # LT_WINDOW(56) + 1일 여유 = 57
+  lookback_days: 57
+
+  # 추론 기준 timezone
+  timezone: "Asia/Seoul"
+
+  # 실행 시각 (EKS CronJob)
+  # 매일 02:00 KST = 전날 17:00 UTC
+  schedule: "0 17 * * *"   # UTC 기준 cron
+
+
+# -----------------------------------------------------------------------------
+# FE 파라미터 (features.py 상수와 동기화 - 변경 시 양쪽 다 수정)
+# -----------------------------------------------------------------------------
+feature_engineering:
+  min_daily_events: 50
+  min_rhythm_events: 50
+  min_gap_events: 50
+  gap_thr_hours: 2.0
+  gap_thr_6hours: 6.0
+  tz_change_thr_minutes: 60
+  partial_core_min_events: 10
+
+
+# -----------------------------------------------------------------------------
+# 모델 파라미터 (model.py 상수와 동기화 - 변경 시 양쪽 다 수정)
+# -----------------------------------------------------------------------------
 model:
-  z_clip: 4.0
-  z_na_thr: 0.60
-  if_contamination: 0.05
-  if_estimators: 300
-  if_seed: 42
-  ema_alpha: 0.25
-  w_z: 0.85
-  w_a: 0.15
-  tau_q: 0.90
-  hold_window: 14
-  hold_minp: 7
-  bad_thr: 0.70
-  stable_thr: 0.45
-  partial_thr: 1.0
-  travel_thr: 2.0
-  tz_thr: 1.0
-  drift_z_thr: 2.0
-  anchor_start: 16
-  anchor_end: 30
+  # Baseline window
+  st_window: 14
+  lt_window: 56
+  early_window: 7
 
+  # Risk 가중치
+  risk_weight_z: 0.85
+  risk_weight_anomaly: 0.15
+  ema_alpha: 0.25
+
+  # Z-score clip
+  z_clip: 4.0
+
+  # Anomaly scaling quantile
+  anomaly_q_low: 0.80
+  anomaly_q_high: 0.99
+
+  # Context discount
+  discount:
+    normal: 1.00
+    partial: 0.60
+    travel: 0.70
+
+  # Drift 감지
+  drift_z_threshold: 2.0
+  anchor_start_day: 16
+  anchor_end_day: 30
+
+
+# -----------------------------------------------------------------------------
+# Decoder 파라미터 (decoder.py 상수와 동기화)
+# -----------------------------------------------------------------------------
 decoder:
-  risk_low: 0.45
-  risk_alert: 0.60
-  risk_severe: 0.70
-  z_threshold: 2.0
-  group_z_threshold: 1.5
-  z_clip_early: 4.0
+  risk_threshold:
+    low:    0.45    # SAFE / WATCH 경계
+    alert:  0.60    # WATCH / ALERT 경계
+    severe: 0.70    # ALERT / SEVERE 경계
+
+  group_z_threshold: 1.5    # 그룹 대표 Z 기준
+  z_threshold: 2.0          # top-Z fallback 기준
+
+
+# -----------------------------------------------------------------------------
+# AWS 설정 (trigger_training.py / Lambda 환경변수로 오버라이드 가능)
+# -----------------------------------------------------------------------------
+aws:
+  region: "ap-northeast-2"
+
+  # Lambda 환경변수로 주입 (여기선 placeholder)
+  sagemaker_role_arn: ""    # arn:aws:iam::ACCOUNT:role/SageMakerRole
+  ecr_image_uri: ""         # 763104351884.dkr.ecr.ap-northeast-2.amazonaws.com/sagemaker-distribution:...
+
+  # EKS
+  eks_cluster: "nyang-ml-cluster"
+  eks_namespace: "nyang"
+  cronjob_name: "nyang-infer-daily"
+
+
+# -----------------------------------------------------------------------------
+# 로컬 개발 / 테스트 설정
+# -----------------------------------------------------------------------------
+local:
+  # 로컬 테스트 시 사용할 더미 parquet 경로
+  dummy_parquet: "notebooks/part-0000.parquet"
+
+  # 로컬 모델 저장 경로
+  model_path: "artifacts/isolation_forest.pkl"

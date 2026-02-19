@@ -1,279 +1,244 @@
 """
 src/runtime/batch_runner.py
-───────────────────────────
-일별 배치 실행 엔트리포인트.
+============================
+EKS CronJob 엔트리포인트 (매일 02:00 KST).
 
-S3에서 silver_events를 읽고, FE → Baseline → Model → Decoder를 순서대로 실행한 후
-결과를 S3에 저장한다.
+[실행 흐름]
+1. S3 silver parquet 읽기 (오늘 기준 lookback_days일치)
+2. inference.run() → state_out DataFrame
+3. 오늘 날짜 결과만 필터 → S3 저장
+4. RDS upsert (stub — ETL/RDS 구현 후 채울 것)
 
-CLI:
-  python -m src.runtime.batch_runner --dt 2024-01-15 [--config config.yaml]
-
-출력 (S3):
-  s3://{ml_bucket}/{outputs}/dt={dt}/state_out.parquet
-  s3://{ml_bucket}/{outputs}/dt={dt}/model_out.parquet
-  s3://{ml_bucket}/{outputs}/dt={dt}/metrics.json
-  s3://{ml_bucket}/{baseline}/dt={dt}/baseline.parquet
-  s3://{ml_bucket}/{artifacts_models}/iso_forest.pkl
+[TODO - ETL/RDS 구현 후]
+- _upsert_rds() 함수 구현
+- DB 스키마: uuid, date, cat_state, notify_level, updated_at
 """
-from __future__ import annotations
 
 import argparse
 import io
-import json
-import logging
 import os
-import pickle
-from datetime import datetime, timedelta
-from typing import Optional
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import List, Optional
 
 import boto3
 import pandas as pd
-import yaml
 
-from src.steps.features import build_daily_features
-from src.steps.baseline import add_time_context, compute_baseline
-from src.steps.model import add_gate_and_context, run_model
-from src.steps.decoder import decode
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.runtime import inference
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ---------------------------------------------------------------------------
+# 0. KST 기준 오늘 날짜
+# ---------------------------------------------------------------------------
+
+KST = timezone(timedelta(hours=9))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# S3 I/O 유틸
-# ──────────────────────────────────────────────────────────────────────────────
+def today_kst() -> str:
+    return datetime.now(KST).strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
+# 1. S3 silver parquet 읽기
+# ---------------------------------------------------------------------------
 
 def _s3_client():
     return boto3.client("s3")
 
 
-def _save_parquet_to_s3(df: pd.DataFrame, bucket: str, key: str) -> None:
-    buf = io.BytesIO()
-    df.to_parquet(buf, index=False, engine="pyarrow")
-    buf.seek(0)
-    _s3_client().put_object(Bucket=bucket, Key=key, Body=buf.read())
-    logger.info(f"Saved parquet → s3://{bucket}/{key}  ({len(df)} rows)")
+def _parse_s3_uri(s3_uri: str):
+    parts  = s3_uri.rstrip("/").replace("s3://", "").split("/", 1)
+    bucket = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ""
+    return bucket, prefix
 
 
-def _load_parquet_from_s3(bucket: str, key: str) -> pd.DataFrame:
-    buf = io.BytesIO()
-    _s3_client().download_fileobj(bucket, key, buf)
-    buf.seek(0)
-    return pd.read_parquet(buf)
-
-
-def _save_json_to_s3(obj: dict, bucket: str, key: str) -> None:
-    body = json.dumps(obj, ensure_ascii=False, default=str)
-    _s3_client().put_object(Bucket=bucket, Key=key, Body=body.encode())
-    logger.info(f"Saved json → s3://{bucket}/{key}")
-
-
-def _save_pickle_to_s3(obj, bucket: str, key: str) -> None:
-    body = pickle.dumps(obj)
-    _s3_client().put_object(Bucket=bucket, Key=key, Body=body)
-    logger.info(f"Saved pickle → s3://{bucket}/{key}")
-
-
-def _load_pickle_from_s3(bucket: str, key: str):
-    buf = io.BytesIO()
-    _s3_client().download_fileobj(bucket, key, buf)
-    buf.seek(0)
-    return pickle.loads(buf.read())
-
-
-def _key_exists(bucket: str, key: str) -> bool:
-    try:
-        _s3_client().head_object(Bucket=bucket, Key=key)
-        return True
-    except Exception:
-        return False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# silver_events 로드 (lookback 60일)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _load_silver_events(
-    config: dict,
-    dt_local: str,
-    lookback_days: int = 60,
-) -> pd.DataFrame:
+def load_silver_parquet(s3_silver_uri: str, lookback_days: int, target_date: str) -> pd.DataFrame:
     """
-    S3 silver_bucket 에서 dt_local 기준 lookback_days 일치 데이터를 로드.
+    target_date 기준 lookback_days일치 silver parquet 로드.
+    dt=YYYY-MM-DD 파티션 구조 가정.
 
-    파티션 구조:
-      s3://{silver_bucket}/silver_events/dt={YYYY-MM-DD}/part-*.parquet
+    rolling baseline 계산을 위해 오늘만이 아닌 과거 데이터 전부 포함.
     """
-    silver_bucket = config["s3"]["silver_bucket"]
-    end_dt   = datetime.strptime(dt_local, "%Y-%m-%d")
-    start_dt = end_dt - timedelta(days=lookback_days - 1)
-
+    bucket, prefix = _parse_s3_uri(s3_silver_uri)
     s3 = _s3_client()
-    dfs = []
-    cur = start_dt
-    while cur <= end_dt:
-        date_str = cur.strftime("%Y-%m-%d")
-        prefix   = f"silver_events/dt={date_str}/"
-        try:
-            resp = s3.list_objects_v2(Bucket=silver_bucket, Prefix=prefix)
-            for obj in resp.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith(".parquet"):
-                    dfs.append(_load_parquet_from_s3(silver_bucket, key))
-        except Exception as e:
-            logger.warning(f"Skipped {date_str}: {e}")
-        cur += timedelta(days=1)
 
-    if not dfs:
+    target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+    cutoff_dt = target_dt - timedelta(days=lookback_days)
+
+    # 파티션 목록
+    paginator = s3.get_paginator("list_objects_v2")
+    keys: List[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".parquet"):
+                continue
+            m = re.search(r"dt=(\d{4}-\d{2}-\d{2})", key)
+            if m:
+                dt = datetime.strptime(m.group(1), "%Y-%m-%d")
+                if cutoff_dt <= dt <= target_dt:
+                    keys.append(key)
+
+    if not keys:
         raise FileNotFoundError(
-            f"No silver_events found for {dt_local} (lookback={lookback_days}d) "
-            f"in s3://{silver_bucket}"
+            f"[BATCH] silver parquet 없음: {s3_silver_uri} "
+            f"({cutoff_dt.date()} ~ {target_dt.date()})"
         )
-    df = pd.concat(dfs, ignore_index=True)
-    logger.info(f"Loaded silver_events: {len(df)} rows, {df['uuid'].nunique()} users")
+
+    print(f"[BATCH] {len(keys)}개 파티션 로드 ({cutoff_dt.date()} ~ {target_dt.date()})")
+    frames = []
+    for key in sorted(keys):
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            frames.append(pd.read_parquet(io.BytesIO(obj["Body"].read())))
+        except Exception as e:
+            print(f"  ⚠️ {key}: {e}")
+
+    if not frames:
+        raise RuntimeError("[BATCH] 파티션 읽기 전부 실패")
+
+    df = pd.concat(frames, ignore_index=True)
+    print(f"[BATCH] silver 로드 완료: {df.shape}, uuid: {df['uuid'].nunique()}")
     return df
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 메트릭 집계
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 2. 결과 S3 저장
+# ---------------------------------------------------------------------------
 
-def _build_metrics(state_df: pd.DataFrame, model_df: pd.DataFrame, dt_local: str) -> dict:
-    metrics: dict = {
-        "dt": dt_local,
-        "n_users": int(state_df["uuid"].nunique()),
-        "n_rows": len(state_df),
-        "cat_state_counts": state_df["cat_state"].value_counts().to_dict(),
-        "notify_level_counts": state_df["notify_level"].value_counts().to_dict(),
-        "decoder_quality_counts": state_df["decoder_quality"].value_counts().to_dict(),
-    }
-    if "final_risk" in model_df.columns:
-        risk = model_df["final_risk"].dropna()
-        metrics["final_risk_mean"] = float(risk.mean()) if len(risk) else None
-        metrics["final_risk_p50"]  = float(risk.quantile(0.50)) if len(risk) else None
-        metrics["final_risk_p90"]  = float(risk.quantile(0.90)) if len(risk) else None
-    return metrics
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 메인 실행 함수
-# ──────────────────────────────────────────────────────────────────────────────
-
-def run_batch(
-    dt_local: str,
-    config: dict,
-    *,
-    lookback_days: int = 60,
-    retrain_iso: bool = False,
-    debug: bool = False,
-) -> dict:
+def save_output_to_s3(state_df: pd.DataFrame, s3_output_uri: str, target_date: str):
     """
-    전체 배치 파이프라인 실행.
-
-    Returns
-    -------
-    dict  metrics 요약
+    오늘 날짜 결과만 필터해서 저장.
+    경로: {s3_output_uri}/dt={target_date}/state_out_v3.csv
     """
-    ml_bucket  = config["s3"]["ml_bucket"]
-    out_prefix = config["paths"]["outputs"].rstrip("/")
-    bl_prefix  = config["paths"]["baseline"].rstrip("/")
-    art_prefix = config["paths"]["artifacts_models"].rstrip("/")
-    iso_key    = f"{art_prefix}/iso_forest.pkl"
+    # 오늘 날짜만 필터
+    today_df = state_df[state_df["date"] == target_date].copy()
+    if today_df.empty:
+        print(f"[BATCH] ⚠️ {target_date} 결과 없음 — 저장 스킵")
+        return
 
-    # ── 1. silver_events 로드 ──────────────────────────────────────────────
-    logger.info(f"[batch] Loading silver_events dt={dt_local}, lookback={lookback_days}d")
-    silver = _load_silver_events(config, dt_local, lookback_days)
+    csv_buf = io.StringIO()
+    today_df.to_csv(csv_buf, index=False)
 
-    # ── 2. Feature Engineering ────────────────────────────────────────────
-    logger.info("[batch] FE start")
-    feature_df = build_daily_features(silver, config, debug=debug)
-    logger.info(f"[batch] FE done: {feature_df.shape}")
+    bucket, prefix = _parse_s3_uri(s3_output_uri)
+    key = f"{prefix}/dt={target_date}/state_out_v3.csv".lstrip("/")
 
-    # ── 3. Time context ───────────────────────────────────────────────────
-    feature_df = add_time_context(feature_df)
-
-    # ── 4. Gate & Context (baseline_fit_mask 생성) ────────────────────────
-    logger.info("[batch] gate & context")
-    feature_df = add_gate_and_context(feature_df, config)
-
-    # ── 5. Baseline ───────────────────────────────────────────────────────
-    logger.info("[batch] baseline")
-    feature_df = compute_baseline(feature_df, config)
-
-    # ── 6. Model (IsolationForest 로드 또는 신규 학습) ────────────────────
-    iso_model: Optional[object] = None
-    if not retrain_iso and _key_exists(ml_bucket, iso_key):
-        logger.info(f"[batch] Loading IsolationForest from s3://{ml_bucket}/{iso_key}")
-        try:
-            iso_model = _load_pickle_from_s3(ml_bucket, iso_key)
-        except Exception as e:
-            logger.warning(f"Failed to load iso model, will retrain: {e}")
-            iso_model = None
-
-    logger.info("[batch] model")
-    model_df, iso_model_new = run_model(feature_df, config, iso_model=iso_model, debug=debug)
-
-    # IsolationForest 저장 (신규 학습된 경우)
-    if iso_model is None and iso_model_new is not None:
-        _save_pickle_to_s3(iso_model_new, ml_bucket, iso_key)
-
-    # ── 7. Decoder ────────────────────────────────────────────────────────
-    logger.info("[batch] decoder")
-    state_df = decode(model_df, config, debug=debug)
-
-    # ── 8. 결과 저장 ──────────────────────────────────────────────────────
-    dt_tag = f"dt={dt_local}"
-
-    state_key   = f"{out_prefix}/{dt_tag}/state_out.parquet"
-    model_key   = f"{out_prefix}/{dt_tag}/model_out.parquet"
-    bl_key      = f"{bl_prefix}/{dt_tag}/baseline.parquet"
-    metrics_key = f"{out_prefix}/{dt_tag}/metrics.json"
-
-    # state 출력 (cat_state / notify_level / decoder_quality 포함 전체)
-    _save_parquet_to_s3(state_df, ml_bucket, state_key)
-
-    # model 중간 결과
-    _save_parquet_to_s3(model_df, ml_bucket, model_key)
-
-    # baseline snapshot (유저별 최신 baseline 파라미터)
-    _save_parquet_to_s3(feature_df, ml_bucket, bl_key)
-
-    # metrics
-    metrics = _build_metrics(state_df, model_df, dt_local)
-    _save_json_to_s3(metrics, ml_bucket, metrics_key)
-
-    logger.info(f"[batch] Done. n_users={metrics['n_users']}, n_rows={metrics['n_rows']}")
-    return metrics
+    s3 = _s3_client()
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=csv_buf.getvalue().encode("utf-8"),
+        ContentType="text/csv",
+    )
+    print(f"[BATCH] S3 저장 완료: s3://{bucket}/{key} ({len(today_df)}행)")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 3. RDS upsert (stub)
+#    TODO: ETL/RDS 구현 후 채울 것
+# ---------------------------------------------------------------------------
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Daily batch runner")
-    parser.add_argument("--dt",        required=True, help="Target date YYYY-MM-DD")
-    parser.add_argument("--config",    default="config.yaml", help="Path to config.yaml")
-    parser.add_argument("--lookback",  type=int, default=60, help="Lookback days for silver_events")
-    parser.add_argument("--retrain",   action="store_true", help="Force IsolationForest retraining")
-    parser.add_argument("--debug",     action="store_true")
+def upsert_rds(state_df: pd.DataFrame, target_date: str):
+    """
+    TODO: RDS에 cat_state, notify_level upsert.
+
+    예상 스키마:
+        CREATE TABLE nyan_state (
+            uuid        VARCHAR(64),
+            date        DATE,
+            cat_state   VARCHAR(16),
+            notify_level VARCHAR(8),
+            updated_at  TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (uuid, date)
+        );
+
+    구현 시 psycopg2 또는 SQLAlchemy 사용 예정.
+    DB 접속 정보는 K8s Secret → 환경변수로 주입.
+    """
+    today_df = state_df[state_df["date"] == target_date]
+    print(f"[BATCH] RDS upsert stub: {len(today_df)}행 (미구현 — 스킵)")
+    # TODO:
+    # import psycopg2
+    # conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    # ...
+
+
+# ---------------------------------------------------------------------------
+# 4. 메인
+# ---------------------------------------------------------------------------
+
+def main(args):
+    target_date = args.target_date or today_kst()
+
+    print("=" * 60)
+    print(f"[BATCH] 실행: {target_date}")
+    print(f"  silver : {args.s3_silver_uri}")
+    print(f"  model  : {args.model_uri}")
+    print(f"  output : {args.s3_output_uri}")
+    print(f"  lookback: {args.lookback_days}일")
+    print("=" * 60)
+
+    # 1. silver 로드 (rolling window 전체 기간)
+    raw_df = load_silver_parquet(args.s3_silver_uri, args.lookback_days, target_date)
+
+    # 2. 추론
+    state_df = inference.run(raw_df=raw_df, model_uri=args.model_uri)
+
+    # 3. S3 저장
+    save_output_to_s3(state_df, args.s3_output_uri, target_date)
+
+    # 4. RDS upsert (stub)
+    upsert_rds(state_df, target_date)
+
+    print(f"[BATCH] 완료 ✅  ({target_date})")
+
+
+# ---------------------------------------------------------------------------
+# 5. 진입점
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="NYAN-MATE 일별 추론 배치")
+
+    parser.add_argument(
+        "--target-date",
+        type=str,
+        default=None,
+        help="추론 기준 날짜 YYYY-MM-DD (기본: 오늘 KST)",
+    )
+    parser.add_argument(
+        "--s3-silver-uri",
+        type=str,
+        default=os.environ.get("S3_SILVER_URI", "s3://silver-dummy/silver_events/"),
+        help="silver parquet S3 URI",
+    )
+    parser.add_argument(
+        "--model-uri",
+        type=str,
+        default=os.environ.get(
+            "MODEL_URI",
+            "s3://nyang-ml-apne2-dev/ml/artifacts/models/isolation_forest.pkl",
+        ),
+        help="iso.pkl S3 URI 또는 로컬 경로",
+    )
+    parser.add_argument(
+        "--s3-output-uri",
+        type=str,
+        default=os.environ.get("S3_OUTPUT_URI", "s3://nyang-ml-apne2-dev/ml/outputs/"),
+        help="결과 저장 S3 URI",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=int(os.environ.get("LOOKBACK_DAYS", "57")),
+        help="rolling baseline 계산용 과거 데이터 일수 (LT_WINDOW+1=57)",
+    )
+
     return parser.parse_args()
 
 
-def main() -> None:
-    args = _parse_args()
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
-    metrics = run_batch(
-        dt_local=args.dt,
-        config=config,
-        lookback_days=args.lookback,
-        retrain_iso=args.retrain,
-        debug=args.debug,
-    )
-    print(json.dumps(metrics, ensure_ascii=False, indent=2, default=str))
-
-
 if __name__ == "__main__":
-    main()
+    main(parse_args())
