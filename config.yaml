@@ -1,0 +1,54 @@
+s3:
+  silver_bucket: "silver-dummy"
+  ml_bucket: "nyang-ml-apne2-dev"
+  ml_prefix: "ml"
+
+paths:
+  artifacts_models: "ml/artifacts/models/"
+  baseline: "ml/baseline/"
+  outputs: "ml/outputs/"
+
+fe:
+  chunksize: 300000        # 참고용 (모듈에선 미사용)
+  long_session_sec: 1800   # 30분
+
+baseline:
+  lt_window: 56
+  st_window: 14
+  early_window: 7
+  lt_minp: 14
+  st_minp_split: 5
+  st_minp_global: 7
+  early_minp: 3
+  winsorize_lower: 0.005
+  winsorize_upper: 0.995
+  default_floor: 0.1
+
+model:
+  z_clip: 4.0
+  z_na_thr: 0.60
+  if_contamination: 0.05
+  if_estimators: 300
+  if_seed: 42
+  ema_alpha: 0.25
+  w_z: 0.85
+  w_a: 0.15
+  tau_q: 0.90
+  hold_window: 14
+  hold_minp: 7
+  bad_thr: 0.70
+  stable_thr: 0.45
+  partial_thr: 1.0
+  travel_thr: 2.0
+  tz_thr: 1.0
+  drift_z_thr: 2.0
+  anchor_start: 16
+  anchor_end: 30
+
+decoder:
+  risk_low: 0.45
+  risk_alert: 0.60
+  risk_severe: 0.70
+  z_threshold: 2.0
+  group_z_threshold: 1.5
+  z_clip_early: 4.0
