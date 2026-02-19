@@ -2,20 +2,20 @@
 src/steps/baseline.py
 ─────────────────────
 notebooks/v3_MODEL.ipynb 섹션 1.4, 3.1-3.7 로직 모듈화.
-
+ 
 I/O 없음 – 순수 pandas/numpy 계산만.
-
+ 
 공개 API:
   add_time_context(df)          -> pd.DataFrame
   compute_baseline(df, config)  -> pd.DataFrame
   winsorize_series(s, lo, hi)   -> pd.Series
 """
 from __future__ import annotations
-
+ 
 import numpy as np
 import pandas as pd
 from typing import Dict, List
-
+ 
 # ──────────────────────────────────────────────────────────────────────────────
 # 상수 (notebook 3.1 그대로)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ EARLY_WINDOW      = 7
 EARLY_MINP_GLOBAL = 3
 EARLY_MINP_SPLIT  = 3
 DEFAULT_FLOOR     = 0.1
-
+ 
 STD_FLOOR_MAP: Dict[str, float] = {
     "daily_event_cnt":   10.0,
     "night_ratio":        0.05,
@@ -46,7 +46,7 @@ STD_FLOOR_MAP: Dict[str, float] = {
     "session_cnt":        1.0,
     "step_sum":           50.0,
 }
-
+ 
 # notebook 3.1 그대로 – 실제 사용 시 df에 있는 것만 필터링
 BASE_COLS_CANDIDATES: List[str] = [
     "Screen", "Notif", "UserAct",
@@ -54,12 +54,12 @@ BASE_COLS_CANDIDATES: List[str] = [
     "gap_max", "gap_cnt_2h", "gap_long_ratio", "overnight_gap",
     "gap_p95", "gap_cnt_6h", "session_total_sec", "session_cnt", "step_sum",
 ]
-
-
+ 
+ 
 # ──────────────────────────────────────────────────────────────────────────────
 # 헬퍼 (노트북 공유)
 # ──────────────────────────────────────────────────────────────────────────────
-
+ 
 def winsorize_series(
     s: pd.Series,
     lower_q: float = 0.005,
@@ -72,16 +72,16 @@ def winsorize_series(
     lo = float(valid.quantile(lower_q))
     hi = float(valid.quantile(upper_q))
     return s.clip(lower=lo, upper=hi)
-
-
+ 
+ 
 # ──────────────────────────────────────────────────────────────────────────────
 # 공개 API
 # ──────────────────────────────────────────────────────────────────────────────
-
+ 
 def add_time_context(df: pd.DataFrame) -> pd.DataFrame:
     """
     notebook 1.4: is_weekend, day_idx, cold_stage 컬럼 추가.
-
+ 
     baseline / context 계산 전에 반드시 먼저 호출.
     """
     df = df.copy()
@@ -100,16 +100,16 @@ def add_time_context(df: pd.DataFrame) -> pd.DataFrame:
         default="ONBOARD",
     )
     return df
-
-
+ 
+ 
 def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     """
     notebook 3.1-3.7: LT / ST / Early baseline 계산 후 컬럼 추가.
-
+ 
     선행 조건:
       add_time_context()        완료  (is_weekend, cold_stage)
       add_gate_and_context()    완료  (baseline_fit_mask)
-
+ 
     추가 컬럼:
       {c}_mean_lt_g / std_lt_g
       {c}_mean_st_g / std_st_g
@@ -119,7 +119,7 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
       baseline_ready, early_ready, analysis_ready
     """
     df = df.copy().sort_values(["uuid", "date"]).reset_index(drop=True)
-
+ 
     bc             = config.get("baseline", {})
     st_window      = int(bc.get("st_window",       ST_WINDOW))
     lt_window      = int(bc.get("lt_window",       LT_WINDOW))
@@ -131,23 +131,23 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     default_floor  = float(bc.get("default_floor", DEFAULT_FLOOR))
     w_lower        = float(bc.get("winsorize_lower", 0.005))
     w_upper        = float(bc.get("winsorize_upper", 0.995))
-
+ 
     base_cols: List[str] = [c for c in BASE_COLS_CANDIDATES if c in df.columns]
     if not base_cols:
         raise ValueError("[baseline] No BASE_COLS found in df. Check FE output.")
-
+ 
     floor_map: Dict[str, float] = dict(STD_FLOOR_MAP)
     for c in base_cols:
         if c not in floor_map:
             floor_map[c] = default_floor
-
+ 
     for c in base_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-
+ 
     if "baseline_fit_mask" not in df.columns:
         raise ValueError("[baseline] baseline_fit_mask missing. Call add_gate_and_context first.")
     fit_mask = pd.Series(df["baseline_fit_mask"]).astype("boolean").fillna(False)
-
+ 
     # ── 3.3  LT Global baseline ─────────────────────────────────────────────
     for c in base_cols:
         x       = pd.to_numeric(df[c], errors="coerce")
@@ -160,7 +160,7 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         std_lt  = std_lt.replace(0, np.nan).fillna(floor).clip(lower=floor)
         df[f"{c}_mean_lt_g"] = mean_lt
         df[f"{c}_std_lt_g"]  = std_lt
-
+ 
     # ── 3.4.1  ST Global ────────────────────────────────────────────────────
     for c in base_cols:
         x         = pd.to_numeric(df[c], errors="coerce")
@@ -173,7 +173,7 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         std_st_g  = std_st_g.replace(0, np.nan).fillna(floor).clip(lower=floor)
         df[f"{c}_mean_st_g"] = mean_st_g
         df[f"{c}_std_st_g"]  = std_st_g
-
+ 
     # ── 3.4.2  ST Split + fallback chain ────────────────────────────────────
     for c in base_cols:
         x     = pd.to_numeric(df[c], errors="coerce")
@@ -191,12 +191,12 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         df[f"{c}_mean_st_s"]        = mean_final
         df[f"{c}_std_st_s"]         = std_final
         df[f"{c}_fallback_stsplit"] = mu_s_raw.isna()
-
+ 
     # ── 3.5  baseline_ready ──────────────────────────────────────────────────
     mean_cols_st = [f"{c}_mean_st_s" for c in base_cols]
     std_cols_st  = [f"{c}_std_st_s"  for c in base_cols]
     df["baseline_ready"] = df[mean_cols_st + std_cols_st].notna().all(axis=1)
-
+ 
     # ── 3.6  Early baseline ──────────────────────────────────────────────────
     for c in base_cols:
         x     = winsorize_series(df[c].where(fit_mask, np.nan), w_lower, w_upper)
@@ -208,7 +208,7 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         sd_g  = sd_g.replace(0, np.nan).fillna(floor).clip(lower=floor)
         df[f"{c}_mean_early_g"] = mu_g
         df[f"{c}_std_early_g"]  = sd_g
-
+ 
         grp  = [df["uuid"], df["is_weekend"]]
         xs2  = x.groupby(grp, sort=False).shift(1)
         roll2 = xs2.groupby(grp, sort=False).rolling(early_window, min_periods=early_minp)
@@ -217,20 +217,20 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         sd_s  = sd_s.replace(0, np.nan).fillna(floor).clip(lower=floor)
         df[f"{c}_mean_early_s"] = mu_s.fillna(df[f"{c}_mean_early_g"])
         df[f"{c}_std_early_s"]  = sd_s.fillna(df[f"{c}_std_early_g"])
-
+ 
     early_mean_cols = [f"{c}_mean_early_s" for c in base_cols]
     early_std_cols  = [f"{c}_std_early_s"  for c in base_cols]
     df["early_ready"] = df[early_mean_cols + early_std_cols].notna().all(axis=1)
-
+ 
     # ── 3.7  최종 baseline 통합 ──────────────────────────────────────────────
     for c in base_cols:
         df[f"{c}_mean_final"] = df[f"{c}_mean_st_s"].fillna(df[f"{c}_mean_early_s"])
         df[f"{c}_std_final"]  = df[f"{c}_std_st_s"].fillna(df[f"{c}_std_early_s"])
-
+ 
     df["analysis_ready"] = (
         df[[f"{c}_mean_final" for c in base_cols] + [f"{c}_std_final" for c in base_cols]]
         .notna().all(axis=1)
     )
-
+ 
     df.attrs["BASE_COLS"] = base_cols
     return df
