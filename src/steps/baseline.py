@@ -1,7 +1,7 @@
 """
 src/steps/baseline.py
 ─────────────────────
-notebooks/v3_MODEL.ipynb 섹션 1.4, 3.1-3.7 로직 모듈화.
+notebooks/v3_MODEL.ipynb 섹션 1.4(cell 4), 3.1-3.7(cells 21-33) 로직 모듈화.
 
 I/O 없음 – 순수 pandas/numpy 계산만.
 
@@ -17,8 +17,9 @@ import pandas as pd
 from typing import Dict, List
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 상수 (notebook 3.1 그대로)
+# 상수  (notebook cell 21 그대로)
 # ──────────────────────────────────────────────────────────────────────────────
+
 ST_WINDOW         = 14
 LT_WINDOW         = 56
 ST_MINP_SPLIT     = 5
@@ -47,7 +48,7 @@ STD_FLOOR_MAP: Dict[str, float] = {
     "step_sum":           50.0,
 }
 
-# notebook 3.1 그대로 – 실제 사용 시 df에 있는 것만 필터링
+# notebook cell 21 BASE_COLS 그대로 – 실제 사용 시 df에 있는 것만 필터링
 BASE_COLS_CANDIDATES: List[str] = [
     "Screen", "Notif", "UserAct",
     "daily_event_cnt", "night_ratio", "hour_entropy",
@@ -57,7 +58,7 @@ BASE_COLS_CANDIDATES: List[str] = [
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 헬퍼 (노트북 공유)
+# 헬퍼
 # ──────────────────────────────────────────────────────────────────────────────
 
 def winsorize_series(
@@ -65,7 +66,7 @@ def winsorize_series(
     lower_q: float = 0.005,
     upper_q: float = 0.995,
 ) -> pd.Series:
-    """유효한 값 기준으로 quantile clip (NaN 보존) – notebook 3.3 그대로."""
+    """유효한 값 기준으로 quantile clip (NaN 보존) – notebook cell 25 그대로."""
     valid = s.dropna()
     if len(valid) < 10:
         return s
@@ -80,16 +81,16 @@ def winsorize_series(
 
 def add_time_context(df: pd.DataFrame) -> pd.DataFrame:
     """
-    notebook 1.4: is_weekend, day_idx, cold_stage 컬럼 추가.
+    notebook cell 4: is_weekend, day_idx, cold_stage 컬럼 추가.
 
     baseline / context 계산 전에 반드시 먼저 호출.
     """
     df = df.copy()
-    df["date"]        = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-    df["is_weekend"]  = df["date"].dt.weekday >= 5
-    first_day         = df.groupby("uuid")["date"].transform("min")
-    df["day_idx"]     = (df["date"] - first_day).dt.days + 1
-    df["cold_stage"]  = np.select(
+    df["date"]       = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df["is_weekend"] = df["date"].dt.weekday >= 5
+    first_day        = df.groupby("uuid")["date"].transform("min")
+    df["day_idx"]    = (df["date"] - first_day).dt.days + 1
+    df["cold_stage"] = np.select(
         [
             df["day_idx"].between(1, 4),
             df["day_idx"].between(5, 8),
@@ -104,7 +105,7 @@ def add_time_context(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     """
-    notebook 3.1-3.7: LT / ST / Early baseline 계산 후 컬럼 추가.
+    notebook cells 21-33: LT / ST / Early baseline 계산 후 컬럼 추가.
 
     선행 조건:
       add_time_context()        완료  (is_weekend, cold_stage)
@@ -114,6 +115,9 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
       {c}_mean_lt_g / std_lt_g
       {c}_mean_st_g / std_st_g
       {c}_mean_st_s / std_st_s   (split + fallback chain)
+      {c}_fallback_stsplit       (per column)
+      fallback_any_stsplit       (combined flag)
+      {c}_mean_early_g / std_early_g
       {c}_mean_early_s / std_early_s
       {c}_mean_final / std_final
       baseline_ready, early_ready, analysis_ready
@@ -145,10 +149,12 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     if "baseline_fit_mask" not in df.columns:
-        raise ValueError("[baseline] baseline_fit_mask missing. Call add_gate_and_context first.")
+        raise ValueError(
+            "[baseline] baseline_fit_mask missing. Call add_gate_and_context first."
+        )
     fit_mask = pd.Series(df["baseline_fit_mask"]).astype("boolean").fillna(False)
 
-    # ── 3.3  LT Global baseline ─────────────────────────────────────────────
+    # ── cell 25: LT Global baseline (56-day) ─────────────────────────────────
     for c in base_cols:
         x       = pd.to_numeric(df[c], errors="coerce")
         x_fit   = winsorize_series(x.where(fit_mask, np.nan), w_lower, w_upper)
@@ -161,7 +167,7 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         df[f"{c}_mean_lt_g"] = mean_lt
         df[f"{c}_std_lt_g"]  = std_lt
 
-    # ── 3.4.1  ST Global ────────────────────────────────────────────────────
+    # ── cell 27 (3.4.1): ST Global (14-day) ──────────────────────────────────
     for c in base_cols:
         x         = pd.to_numeric(df[c], errors="coerce")
         x_fit     = winsorize_series(x.where(fit_mask, np.nan), w_lower, w_upper)
@@ -174,30 +180,39 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         df[f"{c}_mean_st_g"] = mean_st_g
         df[f"{c}_std_st_g"]  = std_st_g
 
-    # ── 3.4.2  ST Split + fallback chain ────────────────────────────────────
+    # ── cell 27 (3.4.2): ST Split (weekend/weekday) + fallback chain ──────────
+    fallback_flags: List[str] = []
     for c in base_cols:
         x     = pd.to_numeric(df[c], errors="coerce")
         x_fit = winsorize_series(x.where(fit_mask, np.nan), w_lower, w_upper)
         grp   = [df["uuid"], df["is_weekend"]]
         xs    = x_fit.groupby(grp, sort=False).shift(1)
         roll  = xs.groupby(grp, sort=False).rolling(st_window, min_periods=st_minp_split)
+
         mu_s_raw = roll.mean().reset_index(level=[0, 1], drop=True).sort_index()
         sd_s_raw = roll.std(ddof=0).reset_index(level=[0, 1], drop=True).sort_index()
         floor    = float(floor_map.get(c, default_floor))
         sd_s_raw = sd_s_raw.replace(0, np.nan).fillna(floor).clip(lower=floor)
+
         # fallback: split → ST global → LT global
         mean_final = mu_s_raw.fillna(df[f"{c}_mean_st_g"]).fillna(df[f"{c}_mean_lt_g"])
         std_final  = sd_s_raw.fillna(df[f"{c}_std_st_g"]).fillna(df[f"{c}_std_lt_g"])
+
         df[f"{c}_mean_st_s"]        = mean_final
         df[f"{c}_std_st_s"]         = std_final
-        df[f"{c}_fallback_stsplit"] = mu_s_raw.isna()
+        flag_col = f"{c}_fallback_stsplit"
+        df[flag_col]                = mu_s_raw.isna()
+        fallback_flags.append(flag_col)
 
-    # ── 3.5  baseline_ready ──────────────────────────────────────────────────
+    df["fallback_any_stsplit"] = df[fallback_flags].any(axis=1)
+
+    # ── cell 29: baseline_ready ───────────────────────────────────────────────
     mean_cols_st = [f"{c}_mean_st_s" for c in base_cols]
     std_cols_st  = [f"{c}_std_st_s"  for c in base_cols]
     df["baseline_ready"] = df[mean_cols_st + std_cols_st].notna().all(axis=1)
+    df = df.copy()
 
-    # ── 3.6  Early baseline ──────────────────────────────────────────────────
+    # ── cell 31: Early baseline (7-day, minp=3) ───────────────────────────────
     for c in base_cols:
         x     = winsorize_series(df[c].where(fit_mask, np.nan), w_lower, w_upper)
         xs    = x.groupby(df["uuid"], sort=False).shift(1)
@@ -209,12 +224,13 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         df[f"{c}_mean_early_g"] = mu_g
         df[f"{c}_std_early_g"]  = sd_g
 
-        grp  = [df["uuid"], df["is_weekend"]]
-        xs2  = x.groupby(grp, sort=False).shift(1)
+        grp   = [df["uuid"], df["is_weekend"]]
+        xs2   = x.groupby(grp, sort=False).shift(1)
         roll2 = xs2.groupby(grp, sort=False).rolling(early_window, min_periods=early_minp)
         mu_s  = roll2.mean().reset_index(level=[0, 1], drop=True).sort_index()
         sd_s  = roll2.std(ddof=0).reset_index(level=[0, 1], drop=True).sort_index()
         sd_s  = sd_s.replace(0, np.nan).fillna(floor).clip(lower=floor)
+
         df[f"{c}_mean_early_s"] = mu_s.fillna(df[f"{c}_mean_early_g"])
         df[f"{c}_std_early_s"]  = sd_s.fillna(df[f"{c}_std_early_g"])
 
@@ -222,7 +238,7 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     early_std_cols  = [f"{c}_std_early_s"  for c in base_cols]
     df["early_ready"] = df[early_mean_cols + early_std_cols].notna().all(axis=1)
 
-    # ── 3.7  최종 baseline 통합 ──────────────────────────────────────────────
+    # ── cell 33: 최종 baseline 통합 ───────────────────────────────────────────
     for c in base_cols:
         df[f"{c}_mean_final"] = df[f"{c}_mean_st_s"].fillna(df[f"{c}_mean_early_s"])
         df[f"{c}_std_final"]  = df[f"{c}_std_st_s"].fillna(df[f"{c}_std_early_s"])
@@ -232,5 +248,6 @@ def compute_baseline(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         .notna().all(axis=1)
     )
 
+    df = df.copy()
     df.attrs["BASE_COLS"] = base_cols
     return df
