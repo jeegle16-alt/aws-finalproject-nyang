@@ -162,11 +162,16 @@ def to_dt_date_hour_from_ms(
     if df.empty:
         return df
 
-    df["date"] = df[dt_col].dt.normalize()
-    df["hour"] = df[dt_col].dt.hour
+    if "tz_offset_minutes" in df.columns:
+        tz_ms = pd.to_numeric(df["tz_offset_minutes"], errors="coerce").fillna(540) * 60 * 1000
+        dt_local = pd.to_datetime(df[ts_col].astype("int64") + tz_ms.astype("int64"), unit="ms", errors="coerce")
+        df["date"] = dt_local.dt.normalize()
+        df["hour"] = dt_local.dt.hour
+    else:
+        df["date"] = df[dt_col].dt.normalize()
+        df["hour"] = df[dt_col].dt.hour
     return df
-
-
+    
 def map_event_to_cat(event_std: pd.Series, event_map: Dict[str, str]) -> pd.Series:
     e = event_std.astype("string").str.strip().str.upper()
     return e.map(event_map).astype("string")
@@ -615,7 +620,12 @@ def build_daily_meta_qc(raw_df: pd.DataFrame) -> pd.DataFrame:
         ch_hb = ch_hb.dropna(subset=["dt_hb"])
         if ch_hb.empty:
             continue
-        ch_hb["date"] = ch_hb["dt_hb"].dt.normalize()
+        if "tz_offset_minutes" in ch_hb.columns:
+            tz_ms = pd.to_numeric(ch_hb["tz_offset_minutes"], errors="coerce").fillna(540) * 60 * 1000
+            dt_local = pd.to_datetime(x.loc[ch_hb.index].astype("int64") + tz_ms.astype("int64"), unit="ms", errors="coerce")
+            ch_hb["date"] = dt_local.dt.normalize()
+        else:
+            ch_hb["date"] = ch_hb["dt_hb"].dt.normalize()
 
         hb_cnt:         Dict = {}
         retry_max_d:    Dict = {}
@@ -733,7 +743,7 @@ def add_soft_context_signals_v3(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[~core_very_low, "partial_signal_raw"] = 0.0
 
     travel = pd.Series(0, index=df.index, dtype=float)
-    tz01   = pd.to_numeric(df["tz_change_signal"], errors="coerce").fillna(0).astype(int)
+    tz01 = pd.to_numeric(df["tz_change_signal"].astype(object), errors="coerce").fillna(0).astype(int)
     travel += (tz01 * 2).astype(float)
 
     if "cell_change_cnt" in df.columns:
