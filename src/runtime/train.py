@@ -28,7 +28,10 @@ import os
 import pickle
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+import mlflow
+import os
+import sklearn
+from datetime import datetime, timedelta, timezone, date as _date
 from pathlib import Path
 from typing import Optional
 
@@ -41,7 +44,7 @@ from src.steps import features, model
 # ---------------------------------------------------------------------------
 # 0. 상수
 # ---------------------------------------------------------------------------
-
+KST = timezone(timedelta(hours=9))
 # ---------------------------------------------------------------------------
 # 1. S3 헬퍼
 # ---------------------------------------------------------------------------
@@ -73,7 +76,6 @@ def _list_keys(s3_uri: str, suffix: str = "") -> list:
                 keys.append(obj["Key"])
     return keys
 
-
 # ---------------------------------------------------------------------------
 # 2. 공개데이터셋 feature parquet 로드  (parquet 1개 → 가볍게 읽기)
 # ---------------------------------------------------------------------------
@@ -104,11 +106,20 @@ def load_public_features(s3_public_feature_uri: str) -> pd.DataFrame:
 # 3. 사용자 ETL parquet 로드 → FE 실행
 # ---------------------------------------------------------------------------
 
-def load_user_features(s3_etl_uri: str, lookback_days: int = 30) -> Optional[pd.DataFrame]:
+def load_user_features(
+    s3_etl_uri: str,
+    lookback_days: int = 30,
+    as_of_date: Optional[_date] = None,
+) -> Optional[pd.DataFrame]:
     """
     S3 silver parquet에서 최근 lookback_days일치 로드 후 FE 실행.
+    기준일(as_of_date)을 중심으로 lookback을 계산한다.
     파일 없으면 None 반환.
     """
+    if as_of_date is None:
+        # 기본: KST 기준 '어제'를 학습 기준일로 잡음 (14일 02시에 돌면 13일 데이터)
+        as_of_date = (datetime.now(KST) - timedelta(days=1)).date()
+
     bucket, _ = _parse_s3_uri(s3_etl_uri)
     all_keys  = _list_keys(s3_etl_uri, suffix=".parquet")
 
@@ -116,19 +127,23 @@ def load_user_features(s3_etl_uri: str, lookback_days: int = 30) -> Optional[pd.
         print(f"[TRAIN] 사용자 ETL 없음 → 공개 feature만 사용")
         return None
 
-    from datetime import date as _date
-    cutoff  = _date.today() - timedelta(days=lookback_days)
+    cutoff = as_of_date - timedelta(days=lookback_days)
+
     filtered = []
     for key in all_keys:
         m = re.search(r"dt=(\d{4}-\d{2}-\d{2})", key)
-        if m and _date.fromisoformat(m.group(1)) >= cutoff:
+        if not m:
+            continue
+        part_dt = _date.fromisoformat(m.group(1))
+        # ✅ cutoff ~ as_of_date 범위만 포함 (미래 파티션 방지)
+        if cutoff <= part_dt <= as_of_date:
             filtered.append(key)
 
     if not filtered:
-        print(f"[TRAIN] ETL 있지만 최근 {lookback_days}일 내 파티션 없음 → 공개만 사용")
+        print(f"[TRAIN] ETL 있지만 {cutoff}~{as_of_date} 범위 파티션 없음 → 공개만 사용")
         return None
 
-    print(f"[TRAIN] 사용자 ETL {len(filtered)}개 파티션 로드 중...")
+    print(f"[TRAIN] 사용자 ETL 파티션 로드: {len(filtered)}개 ({cutoff} ~ {as_of_date})")
     frames = []
     for key in sorted(filtered):
         try:
@@ -187,38 +202,112 @@ def save_model(iso, s3_model_uri: str):
     print(f"[TRAIN] S3 저장 완료: {s3_model_uri}")
     return s3_model_uri
 
-
 # ---------------------------------------------------------------------------
 # 6. 메인
 # ---------------------------------------------------------------------------
 
 def main(args):
-    print("=" * 60)
-    print("[TRAIN] 학습 시작")
-    print(f"  공개 feature : {args.s3_public_feature_uri}")
-    print(f"  사용자 ETL   : {args.s3_etl_uri or '없음 (초기 학습)'}")
-    print(f"  lookback     : {args.lookback_days}일")
-    print("=" * 60)
+    # -----------------------------
+    # MLflow (hardcoded, always on)
+    # -----------------------------
+    MLFLOW_APP_ARN = "arn:aws:sagemaker:ap-northeast-2:211946439649:mlflow-app/app-G6EK75LWNP4K"
+    MLFLOW_EXPERIMENT = "nyang-data-gen"
+    AWS_REGION = "ap-northeast-2"
 
-    # 1. 공개 feature 로드 (parquet 1개 - 가벼움)
-    public_feat = load_public_features(args.s3_public_feature_uri)
+    os.environ["AWS_REGION"] = AWS_REGION
+    os.environ["MLFLOW_TRACKING_AWS_SIGV4"] = "true"
 
-    # 2. 사용자 ETL 로드 + FE (있으면)
-    user_feat = load_user_features(args.s3_etl_uri, args.lookback_days) if args.s3_etl_uri else None
+    mlflow.set_tracking_uri(MLFLOW_APP_ARN)
+    mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    # 3. 합치기
-    feat_df = build_train_features(public_feat, user_feat)
+    with mlflow.start_run(run_name="train-isolation-forest"):
+        # -----------------------------
+        # ✅ 학습 기준일(as_of_date): 기본은 KST 어제
+        # -----------------------------
+        as_of_date = (
+            _date.fromisoformat(args.as_of_date)
+            if args.as_of_date
+            else (datetime.now(KST) - timedelta(days=1)).date()
+        )
+        cutoff = as_of_date - timedelta(days=args.lookback_days)
+    
+        # -----------------------------
+        # ✅ MLflow params (TRAIN에 의미있는 것들)
+        # -----------------------------
+        mlflow.log_param("job_type", "train")
+        mlflow.log_param("s3_public_feature_uri", args.s3_public_feature_uri)
+        mlflow.log_param("s3_etl_uri", args.s3_etl_uri or "")
+        mlflow.log_param("lookback_days", int(args.lookback_days))
+        mlflow.log_param("as_of_date", str(as_of_date))
+        mlflow.log_param("cutoff_date", str(cutoff))
+        mlflow.log_param("s3_model_uri", args.s3_model_uri)
+        mlflow.log_param("timezone", "KST")
+    
+        # -----------------------------
+        # 1) 공개 feature 로드
+        # -----------------------------
+        public_feat = load_public_features(args.s3_public_feature_uri)
+        mlflow.log_metric("public_rows", int(len(public_feat)))
+        mlflow.log_metric("public_users", int(public_feat["uuid"].nunique()))
+        mlflow.log_metric("public_cols", int(public_feat.shape[1]))
+    
+        # -----------------------------
+        # 2) 사용자 ETL 로드 + FE (있으면)
+        # -----------------------------
+        user_feat = None
+        if args.s3_etl_uri:
+            # 파티션 개수도 로깅하고 싶으면 list_keys 기반으로 대략 계산 가능
+            all_keys = _list_keys(args.s3_etl_uri, suffix=".parquet")
+            part_cnt_total = 0
+            part_cnt_used = 0
+            for k in all_keys:
+                m = re.search(r"dt=(\d{4}-\d{2}-\d{2})", k)
+                if not m:
+                    continue
+                part_cnt_total += 1
+                dt = _date.fromisoformat(m.group(1))
+                if cutoff <= dt <= as_of_date:
+                    part_cnt_used += 1
+    
+            mlflow.log_metric("etl_partitions_total", int(part_cnt_total))
+            mlflow.log_metric("etl_partitions_used", int(part_cnt_used))
+    
+            user_feat = load_user_features(
+                args.s3_etl_uri,
+                lookback_days=args.lookback_days,
+                as_of_date=as_of_date,
+            )
+    
+        if user_feat is None:
+            mlflow.log_metric("user_feat_rows", 0)
+            mlflow.log_metric("user_feat_users", 0)
+            mlflow.log_metric("user_feat_cols", 0)
+        else:
+            mlflow.log_metric("user_feat_rows", int(len(user_feat)))
+            mlflow.log_metric("user_feat_users", int(user_feat["uuid"].nunique()))
+            mlflow.log_metric("user_feat_cols", int(user_feat.shape[1]))
+    
+        # -----------------------------
+        # 3) 합치기
+        # -----------------------------
+        feat_df = build_train_features(public_feat, user_feat)
+        mlflow.log_metric("train_rows", int(len(feat_df)))
+        mlflow.log_metric("train_users", int(feat_df["uuid"].nunique()))
+        mlflow.log_metric("train_cols", int(feat_df.shape[1]))
+    
+        # -----------------------------
+        # 4) 학습
+        # -----------------------------
+        _, iso = model.run(feat_df, mode="train")
+        if iso is None:
+            raise RuntimeError("[TRAIN] IsolationForest 학습 실패")
+    
+        # -----------------------------
+        # 5) 저장
+        # -----------------------------
+        save_model(iso, args.s3_model_uri)
 
-    # 4. IF 학습
-    print("[TRAIN] IsolationForest 학습 중...")
-    _, iso = model.run(feat_df, mode="train")
-
-    if iso is None:
-        raise RuntimeError("[TRAIN] IsolationForest 학습 실패")
-
-    # 5. S3 저장
-    save_model(iso, args.s3_model_uri)
-    print("[TRAIN] 완료 ✅")
+        print(f"[TRAIN] 완료 ✅ as_of_date={as_of_date}, model_saved={args.s3_model_uri}")
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +345,12 @@ def parse_args():
             "s3://nyang-ml-apne2-dev/ml/artifacts/models/isolation_forest.pkl",
         ),
         help="모델 S3 저장 경로",
+    )
+    parser.add_argument(
+        "--as-of-date",
+        type=str,
+        default=os.environ.get("AS_OF_DATE", None),
+        help="학습 기준일 YYYY-MM-DD (기본: KST 기준 어제)",
     )
     return parser.parse_args()
 
