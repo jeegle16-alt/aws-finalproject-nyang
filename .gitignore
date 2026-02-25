@@ -1,2 +1,16 @@
 # MLflow temp artifacts
 ml/artifacts/mlflow_tmp/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model artifacts
+*.pkl
+*.joblib
+
+# Data artifacts
+*.parquet
+*.csv
+
+# MLflow artifacts (optional)
+mlflow/
