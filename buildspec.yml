@@ -28,9 +28,15 @@ phases:
   post_build:
     commands:
       - echo "== POST_BUILD =="
-      - echo "Pushing images..."
-      - docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}
-      - docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:latest
+      - |
+        if docker image inspect ${REPO_NAME}:${IMAGE_TAG} >/dev/null 2>&1; then
+          echo "Pushing images..."
+          docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}
+          docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:latest
+        else
+          echo "Build failed — skip push"
+          exit 1
+        fi
       - echo "IMAGE_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:latest"
       - printf '{"image_uri":"%s"}' "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:latest" > image_detail.json
 

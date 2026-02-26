@@ -1,14 +1,14 @@
 # Dockerfile.train
-FROM public.ecr.aws/sagemaker/sagemaker-distribution:py310-cpu
+FROM public.ecr.aws/sagemaker/pytorch-training:2.1.0-cpu-py310-ubuntu20.04
 
 WORKDIR /opt/program
 
-# deps
+# dependencies
 COPY requirements.txt .
-RUN python -m pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # app code
 COPY . .
 
-# SageMaker Training entrypoint
+# SageMaker training entrypoint
 ENTRYPOINT ["python", "-u", "train_entrypoint.py"]
