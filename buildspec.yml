@@ -1,0 +1,39 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_REGION: "ap-northeast-2"
+    ACCOUNT_ID: "211946439649"
+    REPO_NAME: "nyang-training"
+
+phases:
+  pre_build:
+    commands:
+      - echo "== PRE_BUILD =="
+      - aws --version
+      - echo "Logging in to ECR..."
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+      - COMMIT_SHA=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_SHA:-latest}
+      - echo "IMAGE_TAG=$IMAGE_TAG"
+
+  build:
+    commands:
+      - echo "== BUILD =="
+      - echo "Build started on $(date)"
+      - docker build -f Dockerfile.train -t ${REPO_NAME}:${IMAGE_TAG} .
+      - docker tag ${REPO_NAME}:${IMAGE_TAG} ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}
+      - docker tag ${REPO_NAME}:${IMAGE_TAG} ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:latest
+
+  post_build:
+    commands:
+      - echo "== POST_BUILD =="
+      - echo "Pushing images..."
+      - docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}
+      - docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:latest
+      - echo "IMAGE_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:latest"
+      - printf '{"image_uri":"%s"}' "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:latest" > image_detail.json
+
+artifacts:
+  files:
+    - image_detail.json
