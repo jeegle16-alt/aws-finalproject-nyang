@@ -1,11 +1,13 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
+
 WORKDIR /opt/program
 
-# ✅ build toolchain 추가 (gcc)
+# build toolchain (gcc 포함)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential gcc \
     && rm -rf /var/lib/apt/lists/*
 
+# SageMaker training compatibility
 RUN pip install --no-cache-dir -U pip \
     && pip install --no-cache-dir sagemaker-training
 
