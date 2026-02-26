@@ -161,9 +161,8 @@ def build_train_features(public_feat: pd.DataFrame, user_feat: Optional[pd.DataF
 # ---------------------------------------------------------------------------
 
 def save_model(iso, s3_model_prefix: str) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     s3_model_prefix = s3_model_prefix.rstrip("/") + "/"
-    s3_model_uri = s3_model_prefix + f"isolation_forest_{ts}.pkl"
+    s3_model_uri = s3_model_prefix + "isolation_forest.pkl"  # ✅ 항상 overwrite
 
     buf = io.BytesIO()
     pickle.dump(iso, buf)
@@ -171,7 +170,7 @@ def save_model(iso, s3_model_prefix: str) -> str:
 
     bucket, key = _parse_s3_uri(s3_model_uri)
     _s3().put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
-    print(f"[TRAIN] S3 저장 완료: {s3_model_uri}")
+    print(f"[TRAIN] S3 저장 완료(latest only): {s3_model_uri}")
     return s3_model_uri
 
 
