@@ -1,7 +1,16 @@
 # Dockerfile.train
-FROM public.ecr.aws/sagemaker/pytorch-training:2.1.0-cpu-py310-ubuntu20.04
+FROM python:3.10-slim
 
 WORKDIR /opt/program
+
+# (선택) 빌드/런타임에 필요한 OS 패키지
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# SageMaker training compatibility
+RUN pip install --no-cache-dir -U pip \
+    && pip install --no-cache-dir sagemaker-training
 
 # dependencies
 COPY requirements.txt .
@@ -10,5 +19,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 # app code
 COPY . .
 
-# SageMaker training entrypoint
 ENTRYPOINT ["python", "-u", "train_entrypoint.py"]
