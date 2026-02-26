@@ -1,22 +1,16 @@
-# Dockerfile.train
 FROM python:3.10-slim
-
 WORKDIR /opt/program
 
-# (선택) 빌드/런타임에 필요한 OS 패키지
+# ✅ build toolchain 추가 (gcc)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
+    build-essential gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# SageMaker training compatibility
 RUN pip install --no-cache-dir -U pip \
     && pip install --no-cache-dir sagemaker-training
 
-# dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# app code
 COPY . .
-
 ENTRYPOINT ["python", "-u", "train_entrypoint.py"]
